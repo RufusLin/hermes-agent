@@ -1733,6 +1733,50 @@ class TestProviderEntryApiKeyEnvAlias:
         assert normalized is not None
         assert "extra_body" in _VALID_CUSTOM_PROVIDER_FIELDS
         assert normalized["extra_body"] == entry["extra_body"]
+
+    def test_auth_style_is_supported_schema(self):
+        from hermes_cli.config import (
+            _KNOWN_PROVIDER_KEYS,
+            _VALID_CUSTOM_PROVIDER_FIELDS,
+            _custom_provider_entry_to_provider_config,
+            _normalize_custom_provider_entry,
+            get_compatible_custom_providers,
+        )
+        assert "auth_style" in _VALID_CUSTOM_PROVIDER_FIELDS
+        assert "auth_style" in _KNOWN_PROVIDER_KEYS
+
+        entry = {
+            "name": "cf_gw",
+            "base_url": "https://gateway.ai.cloudflare.com/v1/acct/gw/anthropic",
+            "auth_style": "bearer",
+        }
+        normalized = _normalize_custom_provider_entry(dict(entry), provider_key="cf_gw")
+        assert normalized is not None
+        assert normalized["auth_style"] == "bearer"
+
+        converted = _custom_provider_entry_to_provider_config(dict(entry), provider_key="cf_gw")
+        assert converted is not None
+        assert converted["auth_style"] == "bearer"
+
+        # Non-string invalid values must be preserved so downstream lookup fails closed.
+        for bad in (True, 1, ["bearer"], {"style": "bearer"}):
+            bad_norm = _normalize_custom_provider_entry(
+                {"name": "cf_gw", "base_url": entry["base_url"], "auth_style": bad},
+                provider_key="cf_gw",
+            )
+            assert bad_norm is not None
+            assert bad_norm["auth_style"] == bad
+
+        providers = get_compatible_custom_providers({
+            "providers": {
+                "cf_gw": {
+                    "api": entry["base_url"],
+                    "auth_style": "bearer",
+                }
+            }
+        })
+        assert len(providers) == 1
+        assert providers[0]["auth_style"] == "bearer"
 # =============================================================================
 # Tencent TokenHub — API-key provider runtime resolution
 # =============================================================================

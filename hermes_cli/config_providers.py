@@ -108,7 +108,8 @@ _CAMEL_ALIASES: dict[str, str] = {
     "defaultModel": "default_model",
     "contextLength": "context_length",
     "rateLimitDelay": "rate_limit_delay",
-    "sessionAffinityHeader": "session_affinity_header"}
+    "sessionAffinityHeader": "session_affinity_header",
+    "authStyle": "auth_style"}
 
 
 _KNOWN_PROVIDER_KEYS = {
@@ -119,7 +120,7 @@ _KNOWN_PROVIDER_KEYS = {
     "api_mode", "transport", "model", "default_model", "models", "models_discovered",
     "context_length", "rate_limit_delay", "request_timeout_seconds", "stale_timeout_seconds",
     "discover_models", "extra_body", "extra_headers", "capabilities", "ssl_ca_cert", "ssl_verify",
-    "catalog_provider", "session_affinity_header"}
+    "catalog_provider", "session_affinity_header", "auth_style"}
 
 
 def _pick_provider_base_url(entry: dict[str, Any], provider_key: str) -> str:
@@ -279,6 +280,16 @@ def _normalize_custom_provider_entry(
     elif isinstance(ssl_verify, str) and ssl_verify.strip():
         normalized["ssl_verify"] = ssl_verify.strip()
 
+    # Preserve non-string values so downstream auth_style validation fails closed.
+    if "auth_style" in entry and entry["auth_style"] is not None:
+        raw_auth_style = entry["auth_style"]
+        if isinstance(raw_auth_style, str):
+            stripped_auth_style = raw_auth_style.strip()
+            if stripped_auth_style:
+                normalized["auth_style"] = stripped_auth_style
+        else:
+            normalized["auth_style"] = raw_auth_style
+
     return normalized
 
 
@@ -293,7 +304,7 @@ def _custom_provider_entry_to_provider_config(
     for field in (
         "name", "api_key", "key_env", "key_cmd", "models", "models_discovered", "context_length",
         "rate_limit_delay", "discover_models", "extra_body", "extra_headers",
-        "session_affinity_header", "ssl_ca_cert", "ssl_verify", "catalog_provider"):
+        "session_affinity_header", "ssl_ca_cert", "ssl_verify", "catalog_provider", "auth_style"):
         if field in normalized:
             provider_entry[field] = normalized[field]
     if "model" in normalized:
@@ -510,6 +521,51 @@ def apply_custom_provider_extra_headers_to_client_kwargs(
     merged = dict(client_kwargs.get("default_headers") or {})
     merged.update(extra_headers)
     client_kwargs["default_headers"] = merged
+
+
+def normalize_auth_style(value: Any) -> str:
+    """Validate and normalize a per-provider ``auth_style`` value.
+
+    Returns ``""`` when the opt-in is off (missing, ``None``, or empty/whitespace-only string),
+    or ``"bearer"`` when explicitly opted in. Raises ``ValueError`` for any other value.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        if stripped == "bearer":
+            return "bearer"
+        raise ValueError(f"Unknown auth_style {value!r}; expected 'bearer'")
+    raise ValueError(f"Unknown auth_style {value!r} ({type(value).__name__}); expected 'bearer'")
+
+
+def get_custom_provider_auth_style(
+    base_url: str,
+    custom_providers: Optional[list[dict[str, Any]]] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return the normalized ``auth_style`` (``""`` or ``"bearer"``) for *base_url*.
+
+    Inspects every route-matching entry; raises ``ValueError`` if any matching entry
+    declares an unknown ``auth_style`` or if two matching entries disagree after
+    stripping and treating missing/empty/whitespace-only as ``""``.
+    """
+    if not base_url:
+        return ""
+    styles: list[str] = []
+    for entry in _entries_for_route(base_url, custom_providers, config):
+        styles.append(normalize_auth_style(entry.get("auth_style")))
+    if not styles:
+        return ""
+    distinct = set(styles)
+    if len(distinct) > 1:
+        raise ValueError(
+            f"Conflicting auth_style values across matching provider entries for {base_url!r}: "
+            f"{sorted(distinct)}"
+        )
+    return styles[0]
 
 
 def get_custom_provider_session_affinity_header(

@@ -595,10 +595,12 @@ from hermes_cli.config_providers import (
     _pick_provider_base_url, _route_model_cfg, _warn_once_per_provider,
     apply_custom_provider_extra_headers_to_client_kwargs,
     apply_custom_provider_tls_to_client_kwargs, coerce_provider_id, find_provider_entry,
-    get_compatible_custom_providers, get_custom_provider_api_mode, get_custom_provider_context_length,
+    get_compatible_custom_providers, get_custom_provider_api_mode, get_custom_provider_auth_style,
+    get_custom_provider_context_length,
     get_custom_provider_extra_headers, get_custom_provider_model_capability,
     get_custom_provider_session_affinity_header,
-    get_custom_provider_tls_settings, is_provider_enabled, normalize_extra_headers,
+    get_custom_provider_tls_settings, is_provider_enabled, normalize_auth_style,
+    normalize_extra_headers,
     providers_dict_to_custom_providers, stringify_provider_map)
 # Back-compat re-exports — :mod:`hermes_cli.personality` owns personality/overlay semantics.
 from hermes_cli.personality import (
@@ -971,7 +973,7 @@ _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
     "context_length", "rate_limit_delay", "extra_body",
-    "ssl_ca_cert", "ssl_verify", "key_env", "catalog_provider"}
+    "ssl_ca_cert", "ssl_verify", "key_env", "catalog_provider", "auth_style"}
 
 # Fields that look like they should be inside custom_providers, not at root
 _CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}

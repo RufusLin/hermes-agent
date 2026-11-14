@@ -157,6 +157,153 @@ class TestBuildAnthropicClient:
             assert kwargs["max_retries"] == 0
 
 
+class TestPerProviderAuthStyle:
+    CF_URL = "https://gateway.ai.cloudflare.com/v1/acct/gw/anthropic"
+
+    def test_default_third_party_sends_api_key_when_no_matching_entry(self):
+        with patch("hermes_cli.config.load_config", return_value={"providers": {}}), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("cf-token-123", base_url=self.CF_URL)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["api_key"] == "cf-token-123"
+            assert "auth_token" not in kwargs
+            assert kwargs["default_headers"]["Authorization"] is mock_sdk.Omit.return_value
+
+    @pytest.mark.parametrize("auth_style_val", [None, "", "   \t "])
+    def test_default_third_party_sends_api_key_when_auth_style_off(self, auth_style_val):
+        provider_entry = {"api": self.CF_URL}
+        if auth_style_val is not None:
+            provider_entry["auth_style"] = auth_style_val
+        cfg = {"providers": {"cf_gw": provider_entry}}
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("cf-token-123", base_url=self.CF_URL)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["api_key"] == "cf-token-123"
+            assert "auth_token" not in kwargs
+
+    @pytest.mark.parametrize("auth_style_val", ["bearer", " bearer "])
+    def test_bearer_opt_in_uses_auth_token_and_omits_x_api_key(self, auth_style_val):
+        cfg = {"providers": {"cf_gw": {"api": self.CF_URL, "auth_style": auth_style_val}}}
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("cf-token-123", base_url=self.CF_URL)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["auth_token"] == "cf-token-123"
+            assert "api_key" not in kwargs
+            assert kwargs["default_headers"]["X-Api-Key"] is mock_sdk.Omit.return_value
+
+    def test_bearer_opt_in_works_with_legacy_custom_providers(self):
+        cfg = {"custom_providers": [{"name": "cf_gw", "base_url": self.CF_URL, "auth_style": "bearer"}]}
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("cf-token-123", base_url=self.CF_URL)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["auth_token"] == "cf-token-123"
+            assert "api_key" not in kwargs
+            assert kwargs["default_headers"]["X-Api-Key"] is mock_sdk.Omit.return_value
+
+    @pytest.mark.parametrize("bad_value", [
+        "Bearer",
+        "api_key",
+        "auth_token",
+        "oauth",
+        "kimi",
+        True,
+        1,
+        ["bearer"],
+        {"style": "bearer"},
+    ])
+    def test_unknown_auth_style_fails_closed(self, bad_value):
+        cfg = {"providers": {"cf_gw": {"api": self.CF_URL, "auth_style": bad_value}}}
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            with pytest.raises(ValueError):
+                build_anthropic_client("cf-token-123", base_url=self.CF_URL)
+            mock_sdk.Anthropic.assert_not_called()
+
+    def test_unknown_auth_style_fails_closed_even_on_requires_bearer_host(self):
+        minimax_url = "https://api.minimax.io/anthropic"
+        cfg = {"providers": {"minimax": {"api": minimax_url, "auth_style": "oauth"}}}
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            with pytest.raises(ValueError):
+                build_anthropic_client("minimax-secret-123", base_url=minimax_url)
+            mock_sdk.Anthropic.assert_not_called()
+
+    @pytest.mark.parametrize("auth_style_val", [None, "bearer"])
+    def test_requires_bearer_host_keeps_automatic_bearer_style(self, auth_style_val):
+        minimax_url = "https://api.minimax.io/anthropic"
+        entry = {"api": minimax_url}
+        if auth_style_val is not None:
+            entry["auth_style"] = auth_style_val
+        cfg = {"providers": {"minimax": entry}}
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("minimax-secret-123", base_url=minimax_url)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["auth_token"] == "minimax-secret-123"
+            assert "api_key" not in kwargs
+            assert kwargs["default_headers"]["X-Api-Key"] is mock_sdk.Omit.return_value
+
+    def test_oauth_automatic_style_not_downgraded_by_bearer_opt_in(self):
+        native_url = "https://api.anthropic.com"
+        cfg = {"providers": {"anthropic": {"api": native_url, "auth_style": "bearer"}}}
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-oat01-test-oauth-token", base_url=native_url)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["auth_token"] == "sk-ant-oat01-test-oauth-token"
+            assert "api_key" not in kwargs
+            headers = kwargs["default_headers"]
+            assert headers["x-app"] == "cli"
+            assert headers["user-agent"].startswith("claude-code/")
+            assert "oauth-2025-04-20" in headers["anthropic-beta"]
+
+    def test_kimi_automatic_style_not_replaced_by_bearer_opt_in(self):
+        kimi_url = "https://api.kimi.com/coding/v1"
+        cfg = {"providers": {"kimi": {"api": kimi_url, "auth_style": "bearer"}}}
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("kimi-secret-123", base_url=kimi_url)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["api_key"] == "kimi-secret-123"
+            assert "auth_token" not in kwargs
+            assert "User-Agent" in kwargs["default_headers"]
+
+    @pytest.mark.parametrize("second_style", [None, ""])
+    def test_conflicting_auth_style_across_matching_entries_raises(self, second_style):
+        second_entry = {"api": self.CF_URL}
+        if second_style is not None:
+            second_entry["auth_style"] = second_style
+        cfg = {
+            "providers": {
+                "cf_a": {"api": self.CF_URL, "auth_style": "bearer"},
+                "cf_b": second_entry,
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            with pytest.raises(ValueError, match="Conflicting auth_style"):
+                build_anthropic_client("cf-token-123", base_url=self.CF_URL)
+            mock_sdk.Anthropic.assert_not_called()
+
+    def test_matching_entries_same_auth_style_after_strip_do_not_conflict(self):
+        cfg = {
+            "providers": {
+                "cf_a": {"api": self.CF_URL, "auth_style": " bearer"},
+                "cf_b": {"api": self.CF_URL, "auth_style": "bearer"},
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("cf-token-123", base_url=self.CF_URL)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["auth_token"] == "cf-token-123"
+            assert "api_key" not in kwargs
+            assert kwargs["default_headers"]["X-Api-Key"] is mock_sdk.Omit.return_value
+
+
 class TestReadClaudeCodeCredentials:
     @pytest.fixture(autouse=True)
     def no_keychain(self, monkeypatch):

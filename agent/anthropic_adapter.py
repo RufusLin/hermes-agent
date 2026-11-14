@@ -406,6 +406,7 @@ def _build_anthropic_client_with_bearer_hook(
     and rewrites ``Authorization``; the SDK skips its own auth when ``http_client`` is given. The
     placeholder ``auth_token`` is still required at construction and makes any leak diagnosable."""
     sdk = _require_sdk("Azure Foundry Anthropic-style endpoints with Entra ID auth", verb="Install with")
+    _custom_provider_auth_style(base_url)
     normalize_proxy_env_vars()
     from agent.azure_identity_adapter import build_bearer_http_client
     normalized_base_url, kwargs = _base_client_kwargs(base_url, timeout)
@@ -469,22 +470,35 @@ def _custom_provider_extra_headers(base_url) -> dict[str, str]:
         return {}
 
 
+def _custom_provider_auth_style(base_url) -> str:
+    """Per-provider ``auth_style`` override for *base_url* (``""`` or ``"bearer"``).
+
+    Raises ``ValueError`` on unknown or conflicting ``auth_style`` values (fail-closed).
+    """
+    if not base_url:
+        return ""
+    from hermes_cli.config import get_custom_provider_auth_style
+    return get_custom_provider_auth_style(str(base_url))
+
+
 def _auth_style(api_key, base_url, normalized_base_url) -> str:
     """Order-sensitive endpoint/key classification for :func:`build_anthropic_client`. ``kimi``:
     Kimi's /coding endpoint 403s without a User-Agent (the Kimi team asked for proper attribution).
     ``bearer``: MiniMax & co. want Authorization: Bearer — checked before the OAuth shape test
     because their secrets lack the sk-ant-api prefix and would be misread as OAuth/setup tokens.
     ``api_key``: third-party proxies use their own x-api-key keys (skip OAuth detection). ``oauth``:
-    Bearer auth + Claude Code identity (Anthropic routes OAuth by user-agent; without it, 500s)."""
+    Bearer auth + Claude Code identity (Anthropic routes OAuth by user-agent; without it, 500s).
+    Per-provider ``auth_style: bearer`` overrides only the automatic ``api_key`` style."""
+    override = _custom_provider_auth_style(base_url)
     if _is_kimi_coding_endpoint(base_url):
         return "kimi"
     if _requires_bearer_auth(normalized_base_url):
         return "bearer"
     if _is_third_party_anthropic_endpoint(base_url):
-        return "api_key"
+        return override or "api_key"
     if _is_oauth_token(api_key):
         return "oauth"
-    return "api_key"
+    return override or "api_key"
 
 
 def build_anthropic_client(api_key, base_url: str | None = None, timeout: float | None = None, *, drop_context_1m_beta: bool = False):
