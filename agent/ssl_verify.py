@@ -72,6 +72,7 @@ def _coerce_insecure(ssl_verify: Any) -> bool:
 
 
 _CA_CONTEXTS: dict[tuple[str | None, bool], ssl.SSLContext] = {}
+_CA_DIR_CONTEXTS: dict[str, ssl.SSLContext] = {}
 _CA_CONTEXTS_LOCK = threading.Lock()
 
 
@@ -114,6 +115,44 @@ def _shared_context(ca_path: str | None, union: bool = False) -> ssl.SSLContext:
                 ctx.load_verify_locations(cafile=ca_path)
             _CA_CONTEXTS[(ca_path, union)] = ctx
         return ctx
+
+
+def _shared_dir_context(ca_dir: str) -> ssl.SSLContext:
+    """Return a cached union context with ``capath=ca_dir`` on top of platform trust."""
+    with _CA_CONTEXTS_LOCK:
+        ctx = _CA_DIR_CONTEXTS.get(ca_dir)
+        if ctx is None:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            if not _installed:
+                ctx.load_default_certs()
+            ctx.load_verify_locations(capath=ca_dir)
+            _CA_DIR_CONTEXTS[ca_dir] = ctx
+        return ctx
+
+
+def _resolve_env_ca_file(raw_path: str, env_name: str) -> str:
+    """Validate an exported CA bundle path and return its resolved string path."""
+    path = Path(raw_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"{env_name} CA bundle does not exist: {raw_path}")
+    if not path.is_file():
+        raise ValueError(f"{env_name} CA bundle is not a regular file: {raw_path}")
+    resolved = str(path.resolve())
+    with open(resolved, "rb"):
+        pass
+    return resolved
+
+
+def _resolve_env_ca_dir(raw_path: str) -> str:
+    """Validate an exported SSL_CERT_DIR path and return its resolved string path."""
+    path = Path(raw_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"SSL_CERT_DIR does not exist: {raw_path}")
+    if not path.is_dir():
+        raise NotADirectoryError(f"SSL_CERT_DIR is not a directory: {raw_path}")
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise PermissionError(f"SSL_CERT_DIR is not readable: {raw_path}")
+    return str(path.resolve())
 
 
 def platform_ssl_context() -> ssl.SSLContext:
@@ -309,7 +348,14 @@ def resolve_httpx_verify(
     2. explicit ``ca_bundle`` (the provider's ``ssl_ca_cert``) — that
        bundle INSTEAD of the platform store, for an endpoint whose chain
        the machine has no reason to trust
-    3. ``True`` — the platform store, via the process-wide install, or the
+    3. exported ``SSL_CERT_FILE`` (or ``REQUESTS_CA_BUNDLE`` when
+       ``SSL_CERT_FILE`` is unset) — that bundle UNION the platform store;
+       fails closed (raises) if the path is missing, unreadable, non-file,
+       or invalid
+    4. exported ``SSL_CERT_DIR`` (when no CA file env var is set) — that
+       directory UNION the platform store; fails closed if missing or
+       unreadable
+    5. ``True`` — the platform store, via the process-wide install, or the
        platform context when the certifi bundle this process resolved at
        import no longer exists (a replaced install environment)
 
@@ -335,9 +381,16 @@ def resolve_httpx_verify(
             "ssl_ca_cert path does not exist: %s — using the OS trust store instead",
             effective_ca,
         )
-    # HTTPX reads CA env vars before the injected verifier gets control. Pass
-    # the platform context directly so stale paths cannot break construction;
-    # proxy environment handling remains enabled.
-    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
-        return _shared_context(None)
+    # HTTPX reads CA env vars before the injected verifier gets control. Union
+    # an exported bundle or CA directory with the platform trust store and
+    # fail closed when a configured env path is missing or invalid.
+    for env_name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        raw = (os.environ.get(env_name) or "").strip()
+        if raw:
+            return _shared_context(_resolve_env_ca_file(raw, env_name), union=True)
+
+    raw_dir = (os.environ.get("SSL_CERT_DIR") or "").strip()
+    if raw_dir:
+        return _shared_dir_context(_resolve_env_ca_dir(raw_dir))
+
     return _default_verify()

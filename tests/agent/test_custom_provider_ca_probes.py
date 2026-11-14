@@ -20,8 +20,10 @@ def clean_env(monkeypatch):
 @pytest.mark.parametrize("case", ["no-url", "unmatched", "missing-ca", "config-error"])
 @pytest.mark.parametrize("ambient", [False, True])
 def test_probe_policy_edges(clean_env, case, ambient):
+    import certifi
+
     if ambient:
-        clean_env.setenv("SSL_CERT_FILE", "/does/not/exist.pem")
+        clean_env.setenv("SSL_CERT_FILE", certifi.where())
     providers = MagicMock(return_value=[{
         "name": "test", "base_url": _BASE if case != "unmatched" else "https://other.invalid",
         "ssl_ca_cert": "/missing-provider.pem",
@@ -39,6 +41,13 @@ def test_probe_policy_edges(clean_env, case, ambient):
         assert verify is True
     if not url:
         providers.assert_not_called()
+
+
+def test_probe_missing_ambient_ssl_cert_file_fails_closed(clean_env):
+    clean_env.setenv("SSL_CERT_FILE", "/does/not/exist.pem")
+    with patch("hermes_cli.config.get_compatible_custom_providers", return_value=[]):
+        with pytest.raises(FileNotFoundError):
+            resolve_verify(_BASE)
 
 
 def test_public_endpoint_calls_seam_without_ssl_context_kwarg(clean_env):
