@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import ssl
 import threading
 from pathlib import Path
@@ -71,8 +72,9 @@ def _coerce_insecure(ssl_verify: Any) -> bool:
     return False
 
 
-_CA_CONTEXTS: dict[tuple[str | None, bool], ssl.SSLContext] = {}
+_CA_CONTEXTS: dict[tuple[str | None, bool] | tuple[str | None, bool, str], ssl.SSLContext] = {}
 _CA_CONTEXTS_LOCK = threading.Lock()
+_CA_HASH_ENTRY_RE = re.compile(r"^[0-9a-fA-F]{8}\.\d+$")
 
 
 def _stdlib_ssl_context_class() -> type[ssl.SSLContext]:
@@ -93,14 +95,22 @@ def _stdlib_ssl_context_class() -> type[ssl.SSLContext]:
     return _original_SSLContext
 
 
-def _shared_context(ca_path: str | None, union: bool = False) -> ssl.SSLContext:
+def _shared_context(
+    ca_path: str | None,
+    union: bool = False,
+    ca_dir: str | None = None,
+) -> ssl.SSLContext:
     """A stable context identity lets clients reuse the existing transport pool.
 
-    ``union`` adds ``ca_path`` to the platform store (the ``SSL_CERT_FILE``
-    contract) instead of replacing it (a provider ``ssl_ca_cert``).
+    ``union`` adds ``ca_path`` and/or ``ca_dir`` to the platform store (the
+    ``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` / ``SSL_CERT_DIR`` contract)
+    instead of replacing it (a provider ``ssl_ca_cert``).
     """
+    key: tuple[str | None, bool] | tuple[str | None, bool, str] = (
+        (ca_path, union) if ca_dir is None else (ca_path, union, ca_dir)
+    )
     with _CA_CONTEXTS_LOCK:
-        ctx = _CA_CONTEXTS.get((ca_path, union))
+        ctx = _CA_CONTEXTS.get(key)
         if ctx is None:
             if ca_path is not None and not union:
                 # PROTOCOL_TLS_CLIENT sets hostname checking and CERT_REQUIRED;
@@ -112,8 +122,45 @@ def _shared_context(ca_path: str | None, union: bool = False) -> ssl.SSLContext:
                     ctx.load_default_certs()
             if ca_path is not None:
                 ctx.load_verify_locations(cafile=ca_path)
-            _CA_CONTEXTS[(ca_path, union)] = ctx
+            if ca_dir is not None:
+                ctx.load_verify_locations(capath=ca_dir)
+            _CA_CONTEXTS[key] = ctx
         return ctx
+
+
+def _resolve_env_ca_file(raw_path: str, env_name: str) -> str:
+    """Validate an exported CA bundle path and return its resolved string path."""
+    path = Path(raw_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"{env_name} CA bundle does not exist: {raw_path}")
+    if not path.is_file():
+        raise ValueError(f"{env_name} CA bundle is not a regular file: {raw_path}")
+    resolved = str(path.resolve())
+    with open(resolved, "rb"):
+        pass
+    return resolved
+
+
+def _resolve_env_ca_dir(raw_path: str) -> str | None:
+    """Validate an exported SSL_CERT_DIR path and return its resolved string path.
+
+    Returns ``None`` (treat as unset) if the directory exists and is readable
+    but contains no OpenSSL ``c_rehash``-style hashed CA entries (``<hash>.<n>``).
+    """
+    path = Path(raw_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"SSL_CERT_DIR does not exist: {raw_path}")
+    if not path.is_dir():
+        raise NotADirectoryError(f"SSL_CERT_DIR is not a directory: {raw_path}")
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise PermissionError(f"SSL_CERT_DIR is not readable: {raw_path}")
+    resolved = str(path.resolve())
+    with os.scandir(resolved) as entries:
+        has_hashed = any(
+            _CA_HASH_ENTRY_RE.match(entry.name) and entry.is_file()
+            for entry in entries
+        )
+    return resolved if has_hashed else None
 
 
 def platform_ssl_context() -> ssl.SSLContext:
@@ -309,7 +356,22 @@ def resolve_httpx_verify(
     2. explicit ``ca_bundle`` (the provider's ``ssl_ca_cert``) — that
        bundle INSTEAD of the platform store, for an endpoint whose chain
        the machine has no reason to trust
-    3. ``True`` — the platform store, via the process-wide install, or the
+    3. exported ``SSL_CERT_FILE`` (or ``REQUESTS_CA_BUNDLE`` when
+       ``SSL_CERT_FILE`` is unset) and/or ``SSL_CERT_DIR`` — unioned
+       together with the platform store into one cached context;
+       ``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` fail closed (raise) if
+       missing, unreadable, non-file, or invalid; ``SSL_CERT_DIR`` is
+       always validated when set (including alongside a CA file env var)
+       and fails closed (``FileNotFoundError``, ``NotADirectoryError``,
+       ``PermissionError``) if missing, not a directory, or unreadable
+    4. empty / no-hashed-certs ``SSL_CERT_DIR`` policy (treat as unset):
+       whitespace-only ``SSL_CERT_DIR`` is always treated as unset, and an
+       existing, readable ``SSL_CERT_DIR`` with no OpenSSL
+       ``c_rehash``-style hashed entries (``<8-hex>.<digits>``, including
+       an empty directory) is also treated as unset (``capath`` is not
+       loaded, no exception is raised, and the file bundle and/or platform
+       store are used under the no-dir cache key)
+    5. ``True`` — the platform store, via the process-wide install, or the
        platform context when the certifi bundle this process resolved at
        import no longer exists (a replaced install environment)
 
@@ -335,9 +397,20 @@ def resolve_httpx_verify(
             "ssl_ca_cert path does not exist: %s — using the OS trust store instead",
             effective_ca,
         )
-    # HTTPX reads CA env vars before the injected verifier gets control. Pass
-    # the platform context directly so stale paths cannot break construction;
-    # proxy environment handling remains enabled.
-    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
-        return _shared_context(None)
+    # HTTPX reads CA env vars before the injected verifier gets control. Union
+    # any exported CA file and/or hashed CA directory with the platform trust
+    # store and fail closed when a configured env path is missing or invalid.
+    ca_file: str | None = None
+    for env_name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        raw = (os.environ.get(env_name) or "").strip()
+        if raw:
+            ca_file = _resolve_env_ca_file(raw, env_name)
+            break
+
+    raw_dir = (os.environ.get("SSL_CERT_DIR") or "").strip()
+    ca_dir = _resolve_env_ca_dir(raw_dir) if raw_dir else None
+
+    if ca_file is not None or ca_dir is not None:
+        return _shared_context(ca_file, union=True, ca_dir=ca_dir)
+
     return _default_verify()

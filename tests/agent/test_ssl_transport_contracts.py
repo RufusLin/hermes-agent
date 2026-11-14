@@ -92,7 +92,7 @@ def test_provider_ca_reaches_the_real_probe_transport(local_tls, monkeypatch, pr
     assert discover() == ["test-model"]
 
 
-@pytest.mark.parametrize("variable", ["HERMES_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR"])
+@pytest.mark.parametrize("variable", ["HERMES_CA_BUNDLE", "CURL_CA_BUNDLE"])
 def test_ambient_ca_cannot_break_the_shared_client(variable, tmp_path, monkeypatch):
     from run_agent import AIAgent
 
@@ -107,6 +107,15 @@ def test_ambient_ca_cannot_break_the_shared_client(variable, tmp_path, monkeypat
     client = AIAgent._build_keepalive_http_client("https://example.invalid", verify=verify)
     assert client is not None
     client.close()
+
+
+@pytest.mark.parametrize("variable", ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR"])
+def test_missing_ca_env_fails_closed(variable, tmp_path, monkeypatch):
+    for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(variable, str(tmp_path / "missing-ca"))
+    with pytest.raises(FileNotFoundError):
+        ssl_verify.resolve_httpx_verify()
 
 
 @pytest.mark.parametrize("insecure", [False, True])

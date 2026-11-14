@@ -17,10 +17,11 @@ from datetime import UTC
 
 @pytest.fixture
 def no_ca_env(monkeypatch):
-    """An operator's SSL_CERT_FILE flips resolve_httpx_verify() from
-    ``True`` to a shared platform context. Pin the env for this fallback
-    assertion rather than inheriting a developer shell's values."""
+    """Exported CA env vars flip resolve_httpx_verify() from ``True`` to a
+    shared union context (or fail closed if bad). Pin the env for fallback
+    assertions rather than inheriting a developer shell's values."""
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
     monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 
 
@@ -31,12 +32,11 @@ def test_missing_explicit_bundle_falls_back_to_the_platform_store(tmp_path, capl
     assert "does not exist" in caplog.text
 
 
-def test_missing_bundle_under_a_cert_env_var_shares_the_platform_context(tmp_path, monkeypatch):
-    """With SSL_CERT_FILE exported the platform store is handed over as one
-    shared context (httpx would otherwise read the env var itself); a missing
-    bundle must land on that same object, not a second pool. The long-lived
-    clients' platform_ssl_context() honours the bundle ON TOP of the platform
-    store (as httpx verify=True did), cached once."""
+def test_env_ca_bundle_shares_union_context_and_missing_fails_closed(tmp_path, monkeypatch, no_ca_env):
+    """With SSL_CERT_FILE exported to a readable bundle, resolve_httpx_verify()
+    shares the same union context as platform_ssl_context() (bundle + OS store);
+    a missing per-provider ca_bundle falls back to that same union context, while
+    a missing SSL_CERT_FILE fails closed."""
     import ssl
 
     import certifi
@@ -45,15 +45,19 @@ def test_missing_bundle_under_a_cert_env_var_shares_the_platform_context(tmp_pat
 
     monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
     monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
-    platform = resolve_httpx_verify()
-    assert platform is not True
-    assert resolve_httpx_verify(ca_bundle=str(tmp_path / "nope.pem")) is platform
+    union_ctx = resolve_httpx_verify()
+    assert union_ctx is not True and union_ctx is not False
+    assert resolve_httpx_verify(ca_bundle=str(tmp_path / "nope.pem")) is union_ctx
 
     bundle_ctx = ssl_verify.platform_ssl_context()
     assert bundle_ctx is ssl_verify.platform_ssl_context()
-    assert bundle_ctx is not platform
+    assert bundle_ctx is union_ctx
     assert type(bundle_ctx) is ssl.SSLContext  # truststore-injected: bundle + OS store
     assert bundle_ctx is ssl_verify._CA_CONTEXTS[(str(Path(certifi.where()).resolve()), True)]
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing-ca.pem"))
+    with pytest.raises(FileNotFoundError):
+        resolve_httpx_verify()
 
 
 @pytest.mark.parametrize("value", [False, "false", "0", "no", "off", "FALSE"])
@@ -94,7 +98,7 @@ with httpx.Client(verify=resolve_httpx_verify()) as client:
 
 
 @contextmanager
-def _private_https_server(tmp_path: Path) -> Iterator[tuple[Any, Path]]:
+def _private_https_server(tmp_path: Path, *, common_name: str = "Private provider") -> Iterator[tuple[Any, Path]]:
     """A TLS server no public certificate store has ever seen.
 
     Yields ``(server, ca)``: the running server, and the PEM of the CA that signed
@@ -112,7 +116,7 @@ def _private_https_server(tmp_path: Path) -> Iterator[tuple[Any, Path]]:
     from cryptography.x509.oid import NameOID
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Private provider")])
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     now = datetime.now(UTC)
     cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
             .public_key(key.public_key()).serial_number(x509.random_serial_number())
@@ -528,3 +532,488 @@ def test_platform_store_bundle_survives_an_unwritable_home(tmp_path, monkeypatch
     monkeypatch.setattr(ssl_verify, "_PLATFORM_STORE_BUNDLE", None)
     monkeypatch.setattr(ssl_verify, "_stdlib_ssl_context_class", lambda: _StoreWithACert)
     assert ssl_verify._platform_store_bundle() is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_httpx_verify() env CA union & fail-closed contracts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("env_name", ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"])
+def test_resolve_httpx_verify_missing_env_ca_file_fails_closed(tmp_path, monkeypatch, no_ca_env, env_name):
+    """A missing CA file in SSL_CERT_FILE or REQUESTS_CA_BUNDLE must raise, never fall back or return False."""
+    from agent import ssl_verify
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    monkeypatch.setenv(env_name, str(tmp_path / "does-not-exist.pem"))
+    with pytest.raises(FileNotFoundError):
+        resolve_httpx_verify()
+
+
+@pytest.mark.parametrize("env_name", ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"])
+def test_resolve_httpx_verify_non_file_and_invalid_bundle_fail_closed(tmp_path, monkeypatch, no_ca_env, env_name):
+    """Directory, empty file, and non-cert text in SSL_CERT_FILE / REQUESTS_CA_BUNDLE must raise."""
+    import ssl
+
+    from agent import ssl_verify
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    ca_dir = tmp_path / "dir"
+    ca_dir.mkdir()
+    monkeypatch.setenv(env_name, str(ca_dir))
+    with pytest.raises(ValueError):
+        resolve_httpx_verify()
+
+    empty_file = tmp_path / "empty.pem"
+    empty_file.write_text("")
+    monkeypatch.setenv(env_name, str(empty_file))
+    with pytest.raises(ssl.SSLError):
+        resolve_httpx_verify()
+
+    bad_file = tmp_path / "not-a-cert.pem"
+    bad_file.write_text("not a valid certificate\n")
+    monkeypatch.setenv(env_name, str(bad_file))
+    with pytest.raises(ssl.SSLError):
+        resolve_httpx_verify()
+
+
+@pytest.mark.platforms("posix")
+def test_resolve_httpx_verify_unreadable_env_ca_file_fails_closed(tmp_path, monkeypatch, no_ca_env):
+    """An unreadable SSL_CERT_FILE fails closed with PermissionError."""
+    import os
+
+    import certifi
+
+    from agent import ssl_verify
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses file mode 000")
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    unreadable = tmp_path / "unreadable.pem"
+    unreadable.write_text(Path(certifi.where()).read_text())
+    unreadable.chmod(0o000)
+    try:
+        monkeypatch.setenv("SSL_CERT_FILE", str(unreadable))
+        with pytest.raises(PermissionError):
+            resolve_httpx_verify()
+    finally:
+        unreadable.chmod(0o600)
+
+
+def test_resolve_httpx_verify_bad_ssl_cert_file_does_not_fall_back_to_requests_ca_bundle(
+    tmp_path, monkeypatch, no_ca_env
+):
+    """If SSL_CERT_FILE is set to a bad path, fail closed even if REQUESTS_CA_BUNDLE is valid."""
+    import certifi
+
+    from agent import ssl_verify
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing.pem"))
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", certifi.where())
+    with pytest.raises(FileNotFoundError):
+        resolve_httpx_verify()
+
+
+def test_resolve_httpx_verify_ssl_cert_dir_missing_or_file_fails_closed(tmp_path, monkeypatch, no_ca_env):
+    """SSL_CERT_DIR without a file env fails closed when missing or pointing to a regular file."""
+    from agent import ssl_verify
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "no-such-dir"))
+    with pytest.raises(FileNotFoundError):
+        resolve_httpx_verify()
+
+    not_a_dir = tmp_path / "file.pem"
+    not_a_dir.write_text("x")
+    monkeypatch.setenv("SSL_CERT_DIR", str(not_a_dir))
+    with pytest.raises(NotADirectoryError):
+        resolve_httpx_verify()
+
+
+@pytest.mark.parametrize("env_name", ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"])
+def test_resolve_httpx_verify_file_and_bad_ssl_cert_dir_fails_closed(
+    tmp_path, monkeypatch, no_ca_env, env_name
+):
+    """Valid SSL_CERT_FILE / REQUESTS_CA_BUNDLE with missing or non-dir SSL_CERT_DIR must fail closed."""
+    import certifi
+
+    from agent import ssl_verify
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    monkeypatch.setenv(env_name, certifi.where())
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "missing-cert-dir"))
+    with pytest.raises(FileNotFoundError):
+        resolve_httpx_verify()
+
+    not_a_dir = tmp_path / "not-a-dir.pem"
+    not_a_dir.write_text("x")
+    monkeypatch.setenv("SSL_CERT_DIR", str(not_a_dir))
+    with pytest.raises(NotADirectoryError):
+        resolve_httpx_verify()
+
+
+@pytest.mark.platforms("posix")
+def test_resolve_httpx_verify_file_and_unreadable_ssl_cert_dir_fails_closed(
+    tmp_path, monkeypatch, no_ca_env
+):
+    """Valid SSL_CERT_FILE with an unreadable SSL_CERT_DIR fails closed with PermissionError."""
+    import os
+
+    import certifi
+
+    from agent import ssl_verify
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory mode 000")
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    unreadable_dir = tmp_path / "unreadable-certs"
+    unreadable_dir.mkdir()
+    unreadable_dir.chmod(0o000)
+    try:
+        monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
+        monkeypatch.setenv("SSL_CERT_DIR", str(unreadable_dir))
+        with pytest.raises(PermissionError):
+            resolve_httpx_verify()
+    finally:
+        unreadable_dir.chmod(0o700)
+
+
+def test_resolve_httpx_verify_whitespace_ssl_cert_dir_treated_as_unset(tmp_path, monkeypatch, no_ca_env):
+    """Whitespace-only SSL_CERT_DIR is treated as unset with or without a valid file env."""
+    import certifi
+
+    from agent import ssl_verify
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    baseline_no_env = resolve_httpx_verify()
+    monkeypatch.setenv("SSL_CERT_DIR", "   \t\n ")
+    assert resolve_httpx_verify() is baseline_no_env
+
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
+    file_only_ctx = resolve_httpx_verify()
+
+    monkeypatch.setenv("SSL_CERT_DIR", "   ")
+    assert resolve_httpx_verify() is file_only_ctx
+
+
+def test_resolve_httpx_verify_empty_or_unhashed_ssl_cert_dir_treated_as_unset(
+    tmp_path, monkeypatch, no_ca_env
+):
+    """Policy A: an existing, readable SSL_CERT_DIR with no <hash>.<n> entries is treated as unset."""
+    import certifi
+
+    from agent import ssl_verify
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    empty_dir = tmp_path / "empty-certs"
+    empty_dir.mkdir()
+    unhashed_dir = tmp_path / "unhashed-certs"
+    unhashed_dir.mkdir()
+    (unhashed_dir / "ca.pem").write_text(Path(certifi.where()).read_text())
+
+    baseline_no_env = resolve_httpx_verify()
+    for candidate in (empty_dir, unhashed_dir):
+        monkeypatch.setenv("SSL_CERT_DIR", str(candidate))
+        assert resolve_httpx_verify() is baseline_no_env
+
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
+    file_only_ctx = resolve_httpx_verify()
+    for candidate in (empty_dir, unhashed_dir):
+        monkeypatch.setenv("SSL_CERT_DIR", str(candidate))
+        assert resolve_httpx_verify() is file_only_ctx
+
+
+def test_resolve_httpx_verify_both_file_envs_valid_ssl_cert_file_wins(
+    tmp_path, monkeypatch, no_ca_env
+):
+    """When both SSL_CERT_FILE and REQUESTS_CA_BUNDLE are valid, SSL_CERT_FILE wins."""
+    import certifi
+
+    from agent import ssl_verify
+
+    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
+    alt_bundle = tmp_path / "alt-bundle.pem"
+    alt_bundle.write_text(Path(certifi.where()).read_text())
+
+    monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
+    ssl_file_only = resolve_httpx_verify()
+
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(alt_bundle))
+    assert resolve_httpx_verify() is ssl_file_only
+
+
+def test_resolve_httpx_verify_ssl_cert_dir_trusts_hashed_ca_and_rejects_untrusted(tmp_path):
+    """With only SSL_CERT_DIR set to a hashed CA directory, resolve_httpx_verify()
+    trusts that CA via a truststore union context while rejecting an untrusted CA."""
+    import shutil
+    import subprocess
+    import sys
+
+    openssl = shutil.which("openssl")
+    if not openssl:
+        pytest.skip("openssl CLI required to compute subject hash for SSL_CERT_DIR")
+
+    trusted_dir = tmp_path / "trusted"
+    untrusted_dir = tmp_path / "untrusted"
+    ca_dir = tmp_path / "certs"
+    trusted_dir.mkdir()
+    untrusted_dir.mkdir()
+    ca_dir.mkdir()
+
+    with _private_https_server(trusted_dir) as (trusted_srv, trusted_ca), \
+         _private_https_server(untrusted_dir) as (untrusted_srv, _untrusted_ca):
+        cert_hash = subprocess.check_output(
+            [openssl, "x509", "-hash", "-noout", "-in", str(trusted_ca)],
+            text=True,
+        ).strip()
+        (ca_dir / f"{cert_hash}.0").symlink_to(trusted_ca)
+        script = """
+import httpx, ssl, sys
+from agent.ssl_verify import resolve_httpx_verify
+trusted_url, untrusted_url = sys.argv[1:3]
+verify = resolve_httpx_verify()
+assert isinstance(verify, ssl.SSLContext), verify
+assert type(verify).__module__.startswith("truststore"), type(verify)
+resp = httpx.get(trusted_url, verify=verify, timeout=5)
+assert resp.content == b"private provider", resp.content
+try:
+    httpx.get(untrusted_url, verify=verify, timeout=5)
+except httpx.ConnectError:
+    pass
+else:
+    raise AssertionError("untrusted server cert was accepted")
+"""
+        env = _child_env(tmp_path)
+        env["SSL_CERT_DIR"] = str(ca_dir)
+        child = subprocess.run(
+            [
+                sys.executable, "-c", script,
+                f"https://127.0.0.1:{trusted_srv.server_port}/",
+                f"https://127.0.0.1:{untrusted_srv.server_port}/",
+            ],
+            env=env, capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert child.returncode == 0, child.stdout + child.stderr
+
+
+def test_resolve_httpx_verify_unset_env_matches_default_behaviour(tmp_path, monkeypatch, no_ca_env):
+    """With no CA env vars set, resolve_httpx_verify() keeps its pre-change _default_verify() behaviour."""
+    from agent import ssl_verify
+
+    assert resolve_httpx_verify() is True
+
+    _rotated_certifi(tmp_path, monkeypatch, replacement=False)
+    monkeypatch.setattr(ssl_verify, "_reload_certifi_bundle", lambda: None)
+    assert resolve_httpx_verify() is ssl_verify._shared_context(None)
+
+
+@pytest.mark.parametrize("env_name", ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"])
+def test_resolve_httpx_verify_env_ca_trusts_bundle_and_rejects_untrusted_on_real_https(tmp_path, env_name):
+    """With SSL_CERT_FILE (or REQUESTS_CA_BUNDLE fallback) set, resolve_httpx_verify() trusts
+    that bundle via a truststore union context while rejecting an untrusted server cert."""
+    import subprocess
+    import sys
+
+    trusted_dir = tmp_path / "trusted"
+    untrusted_dir = tmp_path / "untrusted"
+    trusted_dir.mkdir()
+    untrusted_dir.mkdir()
+
+    with _private_https_server(trusted_dir) as (trusted_srv, trusted_ca), \
+         _private_https_server(untrusted_dir) as (untrusted_srv, _untrusted_ca):
+        script = """
+import httpx, ssl, sys
+from agent.ssl_verify import resolve_httpx_verify
+trusted_url, untrusted_url = sys.argv[1:3]
+verify = resolve_httpx_verify()
+assert isinstance(verify, ssl.SSLContext), verify
+assert type(verify).__module__.startswith("truststore"), type(verify)
+resp = httpx.get(trusted_url, verify=verify, timeout=5)
+assert resp.content == b"private provider", resp.content
+try:
+    httpx.get(untrusted_url, verify=verify, timeout=5)
+except httpx.ConnectError:
+    pass
+else:
+    raise AssertionError("untrusted server cert was accepted")
+"""
+        env = _child_env(tmp_path)
+        env[env_name] = str(trusted_ca)
+        child = subprocess.run(
+            [
+                sys.executable, "-c", script,
+                f"https://127.0.0.1:{trusted_srv.server_port}/",
+                f"https://127.0.0.1:{untrusted_srv.server_port}/",
+            ],
+            env=env, capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert child.returncode == 0, child.stdout + child.stderr
+
+
+def test_resolve_httpx_verify_unions_env_bundle_with_platform_store_without_replacing_it(tmp_path):
+    """The context returned for SSL_CERT_FILE unions the exported CA with the platform store
+    rather than replacing it: a server signed by the exported CA and a server signed only by
+    the platform store both verify, while an unrelated CA is still rejected."""
+    import subprocess
+    import sys
+
+    env_dir = tmp_path / "env_ca"
+    platform_dir = tmp_path / "platform_ca"
+    untrusted_dir = tmp_path / "untrusted_ca"
+    env_dir.mkdir()
+    platform_dir.mkdir()
+    untrusted_dir.mkdir()
+
+    with _private_https_server(env_dir, common_name="Env CA") as (env_srv, env_ca), \
+         _private_https_server(platform_dir, common_name="Platform CA") as (plat_srv, plat_ca), \
+         _private_https_server(untrusted_dir, common_name="Untrusted CA") as (untrusted_srv, _untrusted_ca):
+        script = """
+import httpx, ssl, sys
+env_url, plat_url, untrusted_url, plat_ca = sys.argv[1:5]
+sys.modules["truststore"] = None
+orig_load_default_certs = ssl.SSLContext.load_default_certs
+def load_platform_plus_test_root(self, purpose=ssl.Purpose.SERVER_AUTH):
+    orig_load_default_certs(self, purpose)
+    self.load_verify_locations(cafile=plat_ca)
+ssl.SSLContext.load_default_certs = load_platform_plus_test_root
+from agent.ssl_verify import resolve_httpx_verify
+verify = resolve_httpx_verify()
+assert isinstance(verify, ssl.SSLContext), verify
+assert httpx.get(env_url, verify=verify, timeout=5).content == b"private provider"
+assert httpx.get(plat_url, verify=verify, timeout=5).content == b"private provider"
+try:
+    httpx.get(untrusted_url, verify=verify, timeout=5)
+except httpx.ConnectError:
+    pass
+else:
+    raise AssertionError("untrusted server cert was accepted")
+"""
+        env = _child_env(tmp_path)
+        env["SSL_CERT_FILE"] = str(env_ca)
+        child = subprocess.run(
+            [
+                sys.executable, "-c", script,
+                f"https://127.0.0.1:{env_srv.server_port}/",
+                f"https://127.0.0.1:{plat_srv.server_port}/",
+                f"https://127.0.0.1:{untrusted_srv.server_port}/",
+                str(plat_ca),
+            ],
+            env=env, capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert child.returncode == 0, child.stdout + child.stderr
+
+
+def test_resolve_httpx_verify_rejects_untrusted_cert_with_unset_env(tmp_path):
+    """With no CA env vars set, resolve_httpx_verify() still rejects an untrusted certificate."""
+    import subprocess
+    import sys
+
+    with _private_https_server(tmp_path) as (server, _ca):
+        script = """
+import httpx, sys
+from agent.ssl_verify import resolve_httpx_verify
+try:
+    httpx.get(sys.argv[1], verify=resolve_httpx_verify(), timeout=5)
+except httpx.ConnectError:
+    pass
+else:
+    raise AssertionError("untrusted server cert was accepted")
+"""
+        child = subprocess.run(
+            [sys.executable, "-c", script, f"https://127.0.0.1:{server.server_port}/"],
+            env=_child_env(tmp_path), capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert child.returncode == 0, child.stdout + child.stderr
+
+
+@pytest.mark.parametrize("file_env", ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"])
+def test_resolve_httpx_verify_unions_file_dir_and_platform_store_and_isolates_cache(
+    tmp_path, file_env
+):
+    """When both a CA file env and SSL_CERT_DIR are set, one union context trusts
+    CAs from the file, the dir, and the platform store, rejects untrusted CAs,
+    and does not collide in the cache with file-only or dir-only contexts."""
+    import shutil
+    import subprocess
+    import sys
+
+    openssl = shutil.which("openssl")
+    if not openssl:
+        pytest.skip("openssl CLI required to compute subject hash for SSL_CERT_DIR")
+
+    file_dir = tmp_path / "file_ca"
+    dir_ca_src = tmp_path / "dir_ca_src"
+    ca_dir = tmp_path / "hashed_certs"
+    platform_dir = tmp_path / "platform_ca"
+    untrusted_dir = tmp_path / "untrusted_ca"
+    for d in (file_dir, dir_ca_src, ca_dir, platform_dir, untrusted_dir):
+        d.mkdir()
+
+    with _private_https_server(file_dir, common_name="File CA") as (file_srv, file_ca), \
+         _private_https_server(dir_ca_src, common_name="Dir CA") as (dir_srv, dir_ca), \
+         _private_https_server(platform_dir, common_name="Platform CA") as (plat_srv, plat_ca), \
+         _private_https_server(untrusted_dir, common_name="Untrusted CA") as (untrusted_srv, _untrusted_ca):
+        cert_hash = subprocess.check_output(
+            [openssl, "x509", "-hash", "-noout", "-in", str(dir_ca)],
+            text=True,
+        ).strip()
+        (ca_dir / f"{cert_hash}.0").symlink_to(dir_ca)
+        script = """
+import httpx, os, ssl, sys
+file_env, file_ca, ca_dir, file_url, dir_url, plat_url, untrusted_url, plat_ca = sys.argv[1:9]
+sys.modules["truststore"] = None
+orig_load_default_certs = ssl.SSLContext.load_default_certs
+def load_platform_plus_test_root(self, purpose=ssl.Purpose.SERVER_AUTH):
+    orig_load_default_certs(self, purpose)
+    self.load_verify_locations(cafile=plat_ca)
+ssl.SSLContext.load_default_certs = load_platform_plus_test_root
+from agent.ssl_verify import resolve_httpx_verify
+
+os.environ[file_env] = file_ca
+os.environ.pop("SSL_CERT_DIR", None)
+file_only_ctx = resolve_httpx_verify()
+
+os.environ.pop(file_env, None)
+os.environ["SSL_CERT_DIR"] = ca_dir
+dir_only_ctx = resolve_httpx_verify()
+
+os.environ[file_env] = file_ca
+os.environ["SSL_CERT_DIR"] = ca_dir
+both_ctx = resolve_httpx_verify()
+
+assert both_ctx is not file_only_ctx
+assert both_ctx is not dir_only_ctx
+assert file_only_ctx is not dir_only_ctx
+assert resolve_httpx_verify() is both_ctx
+
+assert httpx.get(file_url, verify=both_ctx, timeout=5).content == b"private provider"
+assert httpx.get(dir_url, verify=both_ctx, timeout=5).content == b"private provider"
+assert httpx.get(plat_url, verify=both_ctx, timeout=5).content == b"private provider"
+try:
+    httpx.get(untrusted_url, verify=both_ctx, timeout=5)
+except httpx.ConnectError:
+    pass
+else:
+    raise AssertionError("untrusted server cert was accepted")
+"""
+        env = _child_env(tmp_path)
+        child = subprocess.run(
+            [
+                sys.executable, "-c", script,
+                file_env,
+                str(file_ca),
+                str(ca_dir),
+                f"https://127.0.0.1:{file_srv.server_port}/",
+                f"https://127.0.0.1:{dir_srv.server_port}/",
+                f"https://127.0.0.1:{plat_srv.server_port}/",
+                f"https://127.0.0.1:{untrusted_srv.server_port}/",
+                str(plat_ca),
+            ],
+            env=env, capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert child.returncode == 0, child.stdout + child.stderr
